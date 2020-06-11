@@ -20,21 +20,31 @@
 package org.elasticsearch.search.aggregations.metrics;
 
 import org.apache.lucene.document.SortedNumericDocValuesField;
+import org.apache.lucene.document.SortedSetDocValuesField;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.RandomIndexWriter;
+import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.store.Directory;
+import org.apache.lucene.util.BytesRef;
+import org.elasticsearch.common.CheckedConsumer;
 import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.util.BigArrays;
+import org.elasticsearch.index.IndexSettings;
 import org.elasticsearch.index.mapper.MapperService;
 import org.elasticsearch.index.query.QueryShardContext;
+import org.elasticsearch.indices.breaker.CircuitBreakerService;
 import org.elasticsearch.script.MockScriptEngine;
 import org.elasticsearch.script.Script;
 import org.elasticsearch.script.ScriptEngine;
 import org.elasticsearch.script.ScriptModule;
 import org.elasticsearch.script.ScriptService;
 import org.elasticsearch.script.ScriptType;
+import org.elasticsearch.search.aggregations.AggregationBuilder;
 import org.elasticsearch.search.aggregations.AggregatorTestCase;
+import org.elasticsearch.search.aggregations.bucket.terms.StringTerms;
+import org.elasticsearch.search.aggregations.bucket.terms.TermsAggregationBuilder;
 import org.junit.BeforeClass;
 
 import java.io.IOException;
@@ -43,9 +53,11 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Consumer;
 import java.util.function.Function;
 
 import static java.util.Collections.singleton;
+import static org.hamcrest.Matchers.equalTo;
 
 public class ScriptedMetricAggregatorTests extends AggregatorTestCase {
 
@@ -71,7 +83,9 @@ public class ScriptedMetricAggregatorTests extends AggregatorTestCase {
     private static final Script MAP_SCRIPT_PARAMS = new Script(ScriptType.INLINE, MockScriptEngine.NAME, "mapScriptParams",
             Collections.singletonMap("itemValue", 12));
     private static final Script COMBINE_SCRIPT_PARAMS = new Script(ScriptType.INLINE, MockScriptEngine.NAME, "combineScriptParams",
-            Collections.singletonMap("divisor", 4));
+            Collections.singletonMap("multiplier", 4));
+    private static final Script REDUCE_SCRIPT_PARAMS = new Script(ScriptType.INLINE, MockScriptEngine.NAME, "reduceScriptParams",
+            Collections.singletonMap("additional", 2));
     private static final String CONFLICTING_PARAM_NAME = "initialValue";
 
     private static final Script INIT_SCRIPT_SELF_REF = new Script(ScriptType.INLINE, MockScriptEngine.NAME, "initScriptSelfRef",
@@ -105,8 +119,8 @@ public class ScriptedMetricAggregatorTests extends AggregatorTestCase {
             return state;
         });
         SCRIPTS.put("reduceScript", params -> {
-            Map<String, Object> state = (Map<String, Object>) params.get("state");
-            return state;
+            List<Integer> states = (List<Integer>) params.get("states");
+            return states.stream().mapToInt(Integer::intValue).sum();
         });
 
         SCRIPTS.put("initScriptScore", params -> {
@@ -140,9 +154,14 @@ public class ScriptedMetricAggregatorTests extends AggregatorTestCase {
         });
         SCRIPTS.put("combineScriptParams", params -> {
             Map<String, Object> state = (Map<String, Object>) params.get("state");
-            int divisor = ((Integer) params.get("divisor"));
-            return ((List<Integer>) state.get("collector")).stream().mapToInt(Integer::intValue).map(i -> i / divisor).sum();
+            int multiplier = ((Integer) params.get("multiplier"));
+            return ((List<Integer>) state.get("collector")).stream().mapToInt(Integer::intValue).map(i -> i * multiplier).sum();
         });
+        SCRIPTS.put("reduceScriptParams", params ->
+            ((List)params.get("states")).stream().mapToInt(i -> (int)i).sum() +
+                    (int)params.get("aggs_param") + (int)params.get("additional") -
+                    ((List)params.get("states")).size()*24*4
+        );
 
         SCRIPTS.put("initScriptSelfRef", params -> {
             Map<String, Object> state = (Map<String, Object>) params.get("state");
@@ -163,6 +182,17 @@ public class ScriptedMetricAggregatorTests extends AggregatorTestCase {
            return state;
         });
     }
+
+    @Override
+    protected ScriptService getMockScriptService() {
+        MockScriptEngine scriptEngine = new MockScriptEngine(MockScriptEngine.NAME,
+            SCRIPTS,
+            Collections.emptyMap());
+        Map<String, ScriptEngine> engines = Collections.singletonMap(scriptEngine.getType(), scriptEngine);
+
+        return new ScriptService(Settings.EMPTY, engines, ScriptModule.CORE_CONTEXTS);
+    }
+
 
     @SuppressWarnings("unchecked")
     public void testNoDocs() throws IOException {
@@ -279,7 +309,33 @@ public class ScriptedMetricAggregatorTests extends AggregatorTestCase {
                 ScriptedMetric scriptedMetric = search(newSearcher(indexReader, true, true), new MatchAllDocsQuery(), aggregationBuilder);
 
                 // The result value depends on the script params.
-                assertEquals(306, scriptedMetric.aggregation());
+                assertEquals(4896, scriptedMetric.aggregation());
+            }
+        }
+    }
+
+    public void testAggParamsPassedToReduceScript() throws IOException {
+        MockScriptEngine scriptEngine = new MockScriptEngine(MockScriptEngine.NAME, SCRIPTS, Collections.emptyMap());
+        Map<String, ScriptEngine> engines = Collections.singletonMap(scriptEngine.getType(), scriptEngine);
+        ScriptService scriptService =  new ScriptService(Settings.EMPTY, engines, ScriptModule.CORE_CONTEXTS);
+
+        try (Directory directory = newDirectory()) {
+            try (RandomIndexWriter indexWriter = new RandomIndexWriter(random(), directory)) {
+                for (int i = 0; i < 100; i++) {
+                    indexWriter.addDocument(singleton(new SortedNumericDocValuesField("number", i)));
+                }
+            }
+
+            try (IndexReader indexReader = DirectoryReader.open(directory)) {
+                ScriptedMetricAggregationBuilder aggregationBuilder = new ScriptedMetricAggregationBuilder(AGG_NAME);
+                aggregationBuilder.params(Collections.singletonMap("aggs_param", 1))
+                        .initScript(INIT_SCRIPT_PARAMS).mapScript(MAP_SCRIPT_PARAMS)
+                        .combineScript(COMBINE_SCRIPT_PARAMS).reduceScript(REDUCE_SCRIPT_PARAMS);
+                ScriptedMetric scriptedMetric = searchAndReduce(
+                        newSearcher(indexReader, true, true), new MatchAllDocsQuery(), aggregationBuilder, 0);
+
+                // The result value depends on the script params.
+                assertEquals(4803, scriptedMetric.aggregation());
             }
         }
     }
@@ -364,17 +420,64 @@ public class ScriptedMetricAggregatorTests extends AggregatorTestCase {
         }
     }
 
+    public void testAsSubAgg() throws IOException {
+        AggregationBuilder aggregationBuilder = new TermsAggregationBuilder("t").field("t")
+            .subAggregation(
+                new ScriptedMetricAggregationBuilder("scripted").initScript(INIT_SCRIPT)
+                    .mapScript(MAP_SCRIPT)
+                    .combineScript(COMBINE_SCRIPT)
+                    .reduceScript(REDUCE_SCRIPT)
+            );
+        CheckedConsumer<RandomIndexWriter, IOException> buildIndex = iw -> {
+            for (int i = 0; i < 99; i++) {
+                iw.addDocument(singleton(new SortedSetDocValuesField("t", i % 2 == 0 ? new BytesRef("even") : new BytesRef("odd"))));
+            }
+        };
+        Consumer<StringTerms> verify = terms -> {
+            StringTerms.Bucket even = terms.getBucketByKey("even");
+            assertThat(even.getDocCount(), equalTo(50L));
+            ScriptedMetric evenMetric = even.getAggregations().get("scripted");
+            assertThat(evenMetric.aggregation(), equalTo(50));
+            StringTerms.Bucket odd = terms.getBucketByKey("odd");
+            assertThat(odd.getDocCount(), equalTo(49L));
+            ScriptedMetric oddMetric = odd.getAggregations().get("scripted");
+            assertThat(oddMetric.aggregation(), equalTo(49));
+        };
+        testCase(aggregationBuilder, new MatchAllDocsQuery(), buildIndex, verify, keywordField("t"), longField("number"));
+    }
+
     /**
      * We cannot use Mockito for mocking QueryShardContext in this case because
      * script-related methods (e.g. QueryShardContext#getLazyExecutableScript)
      * is final and cannot be mocked
      */
     @Override
-    protected QueryShardContext queryShardContextMock(MapperService mapperService) {
+    protected QueryShardContext queryShardContextMock(IndexSearcher searcher,
+                                                        MapperService mapperService,
+                                                        IndexSettings indexSettings,
+                                                        CircuitBreakerService circuitBreakerService,
+                                                        BigArrays bigArrays) {
         MockScriptEngine scriptEngine = new MockScriptEngine(MockScriptEngine.NAME, SCRIPTS, Collections.emptyMap());
         Map<String, ScriptEngine> engines = Collections.singletonMap(scriptEngine.getType(), scriptEngine);
         ScriptService scriptService =  new ScriptService(Settings.EMPTY, engines, ScriptModule.CORE_CONTEXTS);
-        return new QueryShardContext(0, mapperService.getIndexSettings(), null, null, mapperService, null, scriptService,
-                xContentRegistry(), writableRegistry(), null, null, System::currentTimeMillis, null);
+        return new QueryShardContext(
+            0,
+            indexSettings,
+            BigArrays.NON_RECYCLING_INSTANCE,
+            null,
+            getIndexFieldDataLookup(mapperService, circuitBreakerService),
+            mapperService,
+            null,
+            scriptService,
+            xContentRegistry(),
+            writableRegistry(),
+            null,
+            null,
+            System::currentTimeMillis,
+            null,
+            null,
+            () -> true,
+            valuesSourceRegistry
+        );
     }
 }

@@ -86,7 +86,7 @@ public class DateIntervalWrapper implements ToXContentFragment, Writeable {
     private DateHistogramInterval dateHistogramInterval;
     private IntervalTypeEnum intervalType = IntervalTypeEnum.NONE;
 
-    public static <T extends DateIntervalConsumer> void declareIntervalFields(ObjectParser<T, Void> parser) {
+    public static <T extends DateIntervalConsumer> void declareIntervalFields(ObjectParser<T, String> parser) {
 
         // NOTE: this field is deprecated and will be removed
         parser.declareField((wrapper, interval) -> {
@@ -113,7 +113,7 @@ public class DateIntervalWrapper implements ToXContentFragment, Writeable {
     public DateIntervalWrapper() {}
 
     public DateIntervalWrapper(StreamInput in) throws IOException {
-        if (in.getVersion().before(Version.V_8_0_0)) { // TODO change this after backport
+        if (in.getVersion().before(Version.V_7_2_0)) {
             long interval = in.readLong();
             DateHistogramInterval histoInterval = in.readOptionalWriteable(DateHistogramInterval::new);
 
@@ -137,7 +137,7 @@ public class DateIntervalWrapper implements ToXContentFragment, Writeable {
     /** Get the current interval in milliseconds that is set on this builder. */
     @Deprecated
     public long interval() {
-        DEPRECATION_LOGGER.deprecated(DEPRECATION_TEXT);
+        DEPRECATION_LOGGER.deprecate("date-interval-getter", DEPRECATION_TEXT);
         if (intervalType.equals(IntervalTypeEnum.LEGACY_INTERVAL)) {
             return TimeValue.parseTimeValue(dateHistogramInterval.toString(), "interval").getMillis();
         }
@@ -158,14 +158,14 @@ public class DateIntervalWrapper implements ToXContentFragment, Writeable {
             throw new IllegalArgumentException("[interval] must be 1 or greater for aggregation [date_histogram]");
         }
         setIntervalType(IntervalTypeEnum.LEGACY_INTERVAL);
-        DEPRECATION_LOGGER.deprecated(DEPRECATION_TEXT);
+        DEPRECATION_LOGGER.deprecate("date-interval-setter", DEPRECATION_TEXT);
         this.dateHistogramInterval = new DateHistogramInterval(interval + "ms");
     }
 
     /** Get the current date interval that is set on this builder. */
     @Deprecated
     public DateHistogramInterval dateHistogramInterval() {
-        DEPRECATION_LOGGER.deprecated(DEPRECATION_TEXT);
+        DEPRECATION_LOGGER.deprecate("date-histogram-interval-getter", DEPRECATION_TEXT);
         if (intervalType.equals(IntervalTypeEnum.LEGACY_DATE_HISTO)) {
             return dateHistogramInterval;
         }
@@ -186,7 +186,7 @@ public class DateIntervalWrapper implements ToXContentFragment, Writeable {
             throw new IllegalArgumentException("[dateHistogramInterval] must not be null: [date_histogram]");
         }
         setIntervalType(IntervalTypeEnum.LEGACY_DATE_HISTO);
-        DEPRECATION_LOGGER.deprecated(DEPRECATION_TEXT);
+        DEPRECATION_LOGGER.deprecate("date-histogram-interval-setter", DEPRECATION_TEXT);
         this.dateHistogramInterval = dateHistogramInterval;
     }
 
@@ -275,7 +275,7 @@ public class DateIntervalWrapper implements ToXContentFragment, Writeable {
         }
     }
 
-    public Rounding createRounding(ZoneId timeZone) {
+    public Rounding createRounding(ZoneId timeZone, long offset) {
         Rounding.Builder tzRoundingBuilder;
         if (isEmpty()) {
             throw new IllegalArgumentException("Invalid interval specified, must be non-null and non-empty");
@@ -288,16 +288,21 @@ public class DateIntervalWrapper implements ToXContentFragment, Writeable {
         } else {
             // We're not sure what the interval was originally (legacy) so use old behavior of assuming
             // calendar first, then fixed.  Required because fixed/cal overlap in places ("1h")
-            DateTimeUnit intervalAsUnit = tryIntervalAsCalendarUnit();
-            if (intervalAsUnit != null) {
-                tzRoundingBuilder = Rounding.builder(tryIntervalAsCalendarUnit());
+            DateTimeUnit calInterval = tryIntervalAsCalendarUnit();
+            TimeValue fixedInterval = tryIntervalAsFixedUnit();
+            if (calInterval != null) {
+                tzRoundingBuilder = Rounding.builder(calInterval);
+            } else if (fixedInterval != null) {
+                tzRoundingBuilder = Rounding.builder(fixedInterval);
             } else {
-                tzRoundingBuilder = Rounding.builder(tryIntervalAsFixedUnit());
+                // If we get here we have exhausted our options and are not able to parse this interval
+                throw new IllegalArgumentException("Unable to parse interval [" + dateHistogramInterval + "]");
             }
         }
         if (timeZone != null) {
             tzRoundingBuilder.timeZone(timeZone);
         }
+        tzRoundingBuilder.offset(offset);
         return tzRoundingBuilder.build();
     }
 
@@ -370,7 +375,7 @@ public class DateIntervalWrapper implements ToXContentFragment, Writeable {
 
     @Override
     public void writeTo(StreamOutput out) throws IOException {
-        if (out.getVersion().before(Version.V_8_0_0)) { // TODO change this after backport
+        if (out.getVersion().before(Version.V_7_2_0)) {
             if (intervalType.equals(IntervalTypeEnum.LEGACY_INTERVAL)) {
                 out.writeLong(TimeValue.parseTimeValue(dateHistogramInterval.toString(),
                     DateHistogramAggregationBuilder.NAME + ".innerWriteTo").getMillis());

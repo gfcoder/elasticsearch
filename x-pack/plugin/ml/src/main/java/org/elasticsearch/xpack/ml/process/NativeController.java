@@ -26,7 +26,7 @@ import java.util.concurrent.TimeoutException;
  * Maintains the connection to the native controller daemon that can start other processes.
  */
 @SuppressWarnings("ALL")
-public class NativeController {
+public class NativeController implements MlController {
     private static final Logger LOGGER = LogManager.getLogger(NativeController.class);
 
     /**
@@ -41,25 +41,30 @@ public class NativeController {
     private static final String START_COMMAND = "start";
     private static final String KILL_COMMAND = "kill";
 
-    public static final Map<String, Object> UNKNOWN_NATIVE_CODE_INFO = Map.of("version", "N/A", "build_hash", "N/A");
-
+    private final String localNodeName;
     private final CppLogMessageHandler cppLogHandler;
     private final OutputStream commandStream;
 
-    NativeController(Environment env, NamedPipeHelper namedPipeHelper) throws IOException {
-        ProcessPipes processPipes = new ProcessPipes(env, namedPipeHelper, CONTROLLER, null,
-                true, true, false, false, false, false);
-        processPipes.connectStreams(CONTROLLER_CONNECT_TIMEOUT);
-        cppLogHandler = new CppLogMessageHandler(null, processPipes.getLogStream().get());
-        commandStream = new BufferedOutputStream(processPipes.getCommandStream().get());
+    public static NativeController makeNativeController(String localNodeName, Environment env) throws IOException {
+        return new NativeController(localNodeName, env, new NamedPipeHelper());
     }
 
-    void tailLogsInThread() {
+    NativeController(String localNodeName, Environment env, NamedPipeHelper namedPipeHelper) throws IOException {
+        ProcessPipes processPipes = new ProcessPipes(env, namedPipeHelper, CONTROLLER, null,
+                true, false, false, false, false);
+        processPipes.connectLogStream(CONTROLLER_CONNECT_TIMEOUT);
+        tailLogsInThread(processPipes.getLogStreamHandler());
+        processPipes.connectOtherStreams(CONTROLLER_CONNECT_TIMEOUT);
+        this.localNodeName = localNodeName;
+        this.cppLogHandler = processPipes.getLogStreamHandler();
+        this.commandStream = new BufferedOutputStream(processPipes.getCommandStream().get());
+    }
+
+    static void tailLogsInThread(CppLogMessageHandler cppLogHandler) {
         final Thread logTailThread = new Thread(
                 () -> {
-                    try {
-                        cppLogHandler.tailStream();
-                        cppLogHandler.close();
+                    try (CppLogMessageHandler h = cppLogHandler) {
+                        h.tailStream();
                     } catch (IOException e) {
                         LOGGER.error("Error tailing C++ controller logs", e);
                     }
@@ -78,6 +83,7 @@ public class NativeController {
         return cppLogHandler.getPid(CONTROLLER_CONNECT_TIMEOUT);
     }
 
+    @Override
     public Map<String, Object> getNativeCodeInfo() throws TimeoutException {
         return cppLogHandler.getNativeCodeInfo(CONTROLLER_CONNECT_TIMEOUT);
     }
@@ -98,7 +104,8 @@ public class NativeController {
         }
 
         if (cppLogHandler.hasLogStreamEnded()) {
-            String msg = "Cannot start process [" + command.get(0) + "]: native controller process has stopped";
+            String msg = "Cannot start process [" + command.get(0) + "]: native controller process has stopped on node ["
+                + localNodeName + "]";
             LOGGER.error(msg);
             throw new ElasticsearchException(msg);
         }
@@ -124,7 +131,8 @@ public class NativeController {
         }
 
         if (cppLogHandler.hasLogStreamEnded()) {
-            String msg = "Cannot kill process with PID [" + pid + "]: native controller process has stopped";
+            String msg = "Cannot kill process with PID [" + pid + "]: native controller process has stopped on node ["
+                + localNodeName + "]";
             LOGGER.error(msg);
             throw new ElasticsearchException(msg);
         }
@@ -139,6 +147,7 @@ public class NativeController {
         }
     }
 
+    @Override
     public void stop() throws IOException {
         // The C++ process will exit when it gets EOF on the command stream
         commandStream.close();

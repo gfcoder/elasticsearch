@@ -22,6 +22,7 @@ package org.elasticsearch.action.admin.indices.get;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.IndicesRequest;
 import org.elasticsearch.action.support.ActionFilters;
+import org.elasticsearch.action.support.ActionTestUtils;
 import org.elasticsearch.action.support.replication.ClusterStateCreationUtils;
 import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.metadata.IndexNameExpressionResolver;
@@ -82,7 +83,7 @@ public class GetIndexActionTests extends ESSingleNodeTestCase {
 
     public void testIncludeDefaults() {
         GetIndexRequest defaultsRequest = new GetIndexRequest().indices(indexName).includeDefaults(true);
-        getIndexAction.execute(null, defaultsRequest, ActionListener.wrap(
+        ActionTestUtils.execute(getIndexAction, null, defaultsRequest, ActionListener.wrap(
             defaultsResponse -> assertNotNull(
                 "index.refresh_interval should be set as we are including defaults",
                 defaultsResponse.getSetting(indexName, "index.refresh_interval")
@@ -94,7 +95,7 @@ public class GetIndexActionTests extends ESSingleNodeTestCase {
 
     public void testDoNotIncludeDefaults() {
         GetIndexRequest noDefaultsRequest = new GetIndexRequest().indices(indexName);
-        getIndexAction.execute(null, noDefaultsRequest, ActionListener.wrap(
+        ActionTestUtils.execute(getIndexAction, null, noDefaultsRequest, ActionListener.wrap(
             noDefaultsResponse -> assertNull(
                 "index.refresh_interval should be null as it was never set",
                 noDefaultsResponse.getSetting(indexName, "index.refresh_interval")
@@ -122,12 +123,12 @@ public class GetIndexActionTests extends ESSingleNodeTestCase {
 
     static class Resolver extends IndexNameExpressionResolver {
         @Override
-        public String[] concreteIndexNames(ClusterState state, IndicesRequest request) {
+        public String[] concreteIndexNames(ClusterState state, IndicesRequest request, boolean includeDataStreams) {
             return request.indices();
         }
 
         @Override
-        public Index[] concreteIndices(ClusterState state, IndicesRequest request) {
+        public Index[] concreteIndices(ClusterState state, IndicesRequest request, boolean includeDataStreams) {
             Index[] out = new Index[request.indices().length];
             for (int x = 0; x < out.length; x++) {
                 out[x] = new Index(request.indices()[x], "_na_");

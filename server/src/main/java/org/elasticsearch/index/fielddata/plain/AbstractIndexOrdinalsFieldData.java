@@ -28,25 +28,34 @@ import org.apache.lucene.index.TermsEnum;
 import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.ElasticsearchException;
 import org.elasticsearch.index.IndexSettings;
-import org.elasticsearch.index.fielddata.AtomicOrdinalsFieldData;
 import org.elasticsearch.index.fielddata.IndexFieldDataCache;
 import org.elasticsearch.index.fielddata.IndexOrdinalsFieldData;
+import org.elasticsearch.index.fielddata.LeafOrdinalsFieldData;
 import org.elasticsearch.index.fielddata.ordinals.GlobalOrdinalsBuilder;
+import org.elasticsearch.index.fielddata.ordinals.GlobalOrdinalsIndexFieldData;
 import org.elasticsearch.indices.breaker.CircuitBreakerService;
+import org.elasticsearch.search.aggregations.support.ValuesSourceType;
 
 import java.io.IOException;
 
-public abstract class AbstractIndexOrdinalsFieldData extends AbstractIndexFieldData<AtomicOrdinalsFieldData>
+public abstract class AbstractIndexOrdinalsFieldData extends AbstractIndexFieldData<LeafOrdinalsFieldData>
         implements IndexOrdinalsFieldData {
 
     private final double minFrequency, maxFrequency;
     private final int minSegmentSize;
     protected final CircuitBreakerService breakerService;
 
-    protected AbstractIndexOrdinalsFieldData(IndexSettings indexSettings, String fieldName,
-            IndexFieldDataCache cache, CircuitBreakerService breakerService,
-            double minFrequency, double maxFrequency, int minSegmentSize) {
-        super(indexSettings, fieldName, cache);
+    protected AbstractIndexOrdinalsFieldData(
+        IndexSettings indexSettings,
+        String fieldName,
+        ValuesSourceType valuesSourceType,
+        IndexFieldDataCache cache,
+        CircuitBreakerService breakerService,
+        double minFrequency,
+        double maxFrequency,
+        int minSegmentSize
+    ) {
+        super(indexSettings, fieldName, valuesSourceType, cache);
         this.breakerService = breakerService;
         this.minFrequency = minFrequency;
         this.maxFrequency = maxFrequency;
@@ -60,6 +69,17 @@ public abstract class AbstractIndexOrdinalsFieldData extends AbstractIndexFieldD
 
     @Override
     public IndexOrdinalsFieldData loadGlobal(DirectoryReader indexReader) {
+        IndexOrdinalsFieldData fieldData = loadGlobalInternal(indexReader);
+        if (fieldData instanceof GlobalOrdinalsIndexFieldData) {
+            // we create a new instance of the cached value for each consumer in order
+            // to avoid creating new TermsEnums for each segment in the cached instance
+            return ((GlobalOrdinalsIndexFieldData) fieldData).newConsumer(indexReader);
+        } else {
+            return fieldData;
+        }
+    }
+
+    private IndexOrdinalsFieldData loadGlobalInternal(DirectoryReader indexReader) {
         if (indexReader.leaves().size() <= 1) {
             // ordinals are already global
             return this;
@@ -96,12 +116,12 @@ public abstract class AbstractIndexOrdinalsFieldData extends AbstractIndexFieldD
     @Override
     public IndexOrdinalsFieldData localGlobalDirect(DirectoryReader indexReader) throws Exception {
         return GlobalOrdinalsBuilder.build(indexReader, this, indexSettings, breakerService, logger,
-                AbstractAtomicOrdinalsFieldData.DEFAULT_SCRIPT_FUNCTION);
+                AbstractLeafOrdinalsFieldData.DEFAULT_SCRIPT_FUNCTION);
     }
 
     @Override
-    protected AtomicOrdinalsFieldData empty(int maxDoc) {
-        return AbstractAtomicOrdinalsFieldData.empty();
+    protected LeafOrdinalsFieldData empty(int maxDoc) {
+        return AbstractLeafOrdinalsFieldData.empty();
     }
 
     protected TermsEnum filter(Terms terms, TermsEnum iterator, LeafReader reader) throws IOException {
@@ -124,6 +144,11 @@ public abstract class AbstractIndexOrdinalsFieldData extends AbstractIndexFieldD
             }
         }
         return iterator;
+    }
+
+    @Override
+    public boolean supportsGlobalOrdinalsMapping() {
+        return false;
     }
 
     private static final class FrequencyFilter extends FilteredTermsEnum {

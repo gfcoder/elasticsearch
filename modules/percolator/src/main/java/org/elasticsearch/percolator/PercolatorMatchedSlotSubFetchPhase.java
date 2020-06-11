@@ -30,7 +30,6 @@ import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.Weight;
 import org.apache.lucene.util.BitSet;
 import org.apache.lucene.util.BitSetIterator;
-import org.elasticsearch.Version;
 import org.elasticsearch.common.document.DocumentField;
 import org.elasticsearch.common.lucene.search.Queries;
 import org.elasticsearch.search.SearchHit;
@@ -39,9 +38,7 @@ import org.elasticsearch.search.internal.SearchContext;
 
 import java.io.IOException;
 import java.util.Arrays;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
@@ -61,7 +58,9 @@ final class PercolatorMatchedSlotSubFetchPhase implements FetchSubPhase {
         innerHitsExecute(context.query(), context.searcher(), hits);
     }
 
-    static void innerHitsExecute(Query mainQuery, IndexSearcher indexSearcher, SearchHit[] hits) throws IOException {
+    static void innerHitsExecute(Query mainQuery,
+                                 IndexSearcher indexSearcher,
+                                 SearchHit[] hits) throws IOException {
         List<PercolateQuery> percolateQueries = locatePercolatorQuery(mainQuery);
         if (percolateQueries.isEmpty()) {
             return;
@@ -71,12 +70,8 @@ final class PercolatorMatchedSlotSubFetchPhase implements FetchSubPhase {
         for (PercolateQuery percolateQuery : percolateQueries) {
             String fieldName = singlePercolateQuery ? FIELD_NAME_PREFIX : FIELD_NAME_PREFIX + "_" + percolateQuery.getName();
             IndexSearcher percolatorIndexSearcher = percolateQuery.getPercolatorIndexSearcher();
-            // there is a bug in lucene's MemoryIndex that doesn't allow us to use docValues here...
-            // See https://issues.apache.org/jira/browse/LUCENE-8055
-            // for now we just use version 6.0 version to find nested parent
-            final Version version = Version.V_6_0_0; //context.mapperService().getIndexSettings().getIndexVersionCreated();
-            Weight weight = percolatorIndexSearcher.createWeight(percolatorIndexSearcher.rewrite(Queries.newNonNestedFilter(version)),
-                    ScoreMode.COMPLETE_NO_SCORES, 1f);
+            Weight weight = percolatorIndexSearcher.createWeight(percolatorIndexSearcher.rewrite(Queries.newNonNestedFilter()),
+                ScoreMode.COMPLETE_NO_SCORES, 1f);
             Scorer s = weight.scorer(percolatorIndexSearcher.getIndexReader().leaves().get(0));
             int memoryIndexMaxDoc = percolatorIndexSearcher.getIndexReader().maxDoc();
             BitSet rootDocs = BitSet.of(s.iterator(), memoryIndexMaxDoc);
@@ -104,13 +99,9 @@ final class PercolatorMatchedSlotSubFetchPhase implements FetchSubPhase {
                     continue;
                 }
 
-                Map<String, DocumentField> fields = hit.fieldsOrNull();
-                if (fields == null) {
-                    fields = new HashMap<>();
-                    hit.fields(fields);
-                }
                 IntStream slots = convertTopDocsToSlots(topDocs, rootDocsBySlot);
-                fields.put(fieldName, new DocumentField(fieldName, slots.boxed().collect(Collectors.toList())));
+                // _percolator_document_slot fields are document fields and should be under "fields" section in a hit
+                hit.setDocumentField(fieldName, new DocumentField(fieldName, slots.boxed().collect(Collectors.toList())));
             }
         }
     }
